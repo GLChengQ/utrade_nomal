@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>合约交易面板</title>
+<style>
+  :root {
+    --bg: #0e1117;
+    --card: #171c26;
+    --border: #262d3a;
+    --text: #e6e9ef;
+    --muted: #8b93a3;
+    --green: #16c784;
+    --red: #ea3943;
+    --accent: #4c8dff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    padding: 12px 12px 30px; max-width: 640px; margin: 0 auto;
+    -webkit-font-smoothing: antialiased;
+  }
+  header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .title { font-size: 18px; font-weight: 700; }
+  .sub { color: var(--muted); font-size: 12px; }
+  .badge {
+    margin-left: auto; font-size: 11px; padding: 3px 9px; border-radius: 20px;
+    background: #1c2530; color: var(--muted); border: 1px solid var(--border);
+  }
+  .badge.on { background: rgba(22,199,132,.12); color: var(--green); border-color: rgba(22,199,132,.35); }
+  .badge.off { background: rgba(234,57,67,.12); color: var(--red); border-color: rgba(234,57,67,.35); }
+  .alert {
+    display: none; background: rgba(234,57,67,.12); border: 1px solid rgba(234,57,67,.4);
+    color: var(--red); padding: 10px 12px; border-radius: 10px; margin-bottom: 12px; font-size: 13px;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 14px; margin-bottom: 12px;
+  }
+  .label { color: var(--muted); font-size: 12px; margin-bottom: 8px; letter-spacing: .3px; }
+  .big { font-size: 34px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .row { display: flex; gap: 20px; margin-top: 10px; }
+  .row > div { flex: 1; }
+  .row span { display: block; color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+  .row b { font-size: 15px; font-variant-numeric: tabular-nums; }
+  canvas { width: 100%; height: 120px; display: block; }
+  .pos { display: flex; align-items: center; gap: 8px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+  .pos:last-child { border-bottom: none; }
+  .pos .sym { font-weight: 600; font-size: 14px; }
+  .pill { font-size: 10px; padding: 2px 7px; border-radius: 5px; font-weight: 700; }
+  .pill.long { background: rgba(22,199,132,.15); color: var(--green); }
+  .pill.short { background: rgba(234,57,67,.15); color: var(--red); }
+  .pos .meta { margin-left: auto; text-align: right; }
+  .pos .meta b { font-size: 13px; font-variant-numeric: tabular-nums; }
+  .pos .meta span { display: block; color: var(--muted); font-size: 10px; }
+  .trade { display: flex; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 12px; align-items: center; }
+  .trade:last-child { border-bottom: none; }
+  .trade .pnl { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .kv { display: flex; justify-content: space-between; font-size: 12px; padding: 4px 0; }
+  .kv .k { color: var(--muted); }
+  .empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
+  footer { text-align: center; color: var(--muted); font-size: 11px; margin-top: 6px; }
+  .up { color: var(--green); } .down { color: var(--red); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="title">合约交易面板</div>
+    <div class="sub" id="env">--</div>
+    <div class="badge" id="session">--</div>
+  </header>
+
+  <div class="alert" id="halted"></div>
+
+  <div class="card">
+    <div class="label">账户权益 (USDT)</div>
+    <div class="big" id="equity">--</div>
+    <div class="row">
+      <div><span>可用余额</span><b id="available">--</b></div>
+      <div><span>未实现盈亏</span><b id="upnl">--</b></div>
+    </div>
+    <div class="row">
+      <div><span>当日起始</span><b id="daily_start">--</b></div>
+      <div><span>当日盈亏</span><b id="daily_pnl">--</b></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label">权益曲线</div>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="label">持仓 (<span id="poscount">0</span>)</div>
+    <div id="positions"><div class="empty">暂无持仓</div></div>
+  </div>
+
+  <div class="card">
+    <div class="label">最近成交</div>
+    <div id="trades"><div class="empty">暂无成交</div></div>
+  </div>
+
+  <div class="card">
+    <div class="label">系统状态</div>
+    <div id="sysinfo"><div class="empty">--</div></div>
+  </div>
+
+  <footer>每 15 秒自动刷新 · 更新于 <span id="refresh">--</span></footer>
+
+<script>
+function fmt(n, d) {
+  if (n === null || n === undefined || isNaN(n)) return "--";
+  return Number(n).toFixed(d === undefined ? 2 : d);
+}
+function fmtMoney(n) { return fmt(n, 2); }
+function colorCls(n) { return n > 0 ? "up" : (n < 0 ? "down" : ""); }
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/summary", { cache: "no-store" });
+    const d = await r.json();
+    render(d);
+  } catch (e) {
+    document.getElementById("refresh").textContent = "连接失败";
+  }
+}
+
+function render(d) {
+  const a = d.account || {};
+  const b = d.bot || {};
+  document.getElementById("env").textContent = d.env + " · " + b.symbols.length + " 币种 · " + b.interval;
+  document.getElementById("equity").textContent = fmtMoney(a.total_balance);
+
+  const avail = document.getElementById("available");
+  avail.textContent = fmtMoney(a.available_balance);
+  const upnl = document.getElementById("upnl");
+  upnl.textContent = (a.unrealized_pnl >= 0 ? "+" : "") + fmtMoney(a.unrealized_pnl);
+  upnl.className = colorCls(a.unrealized_pnl);
+
+  const start = d.daily && d.daily.start_equity;
+  document.getElementById("daily_start").textContent = start ? fmtMoney(start) : "--";
+  const dp = document.getElementById("daily_pnl");
+  const dailyPnl = (start !== null && start !== undefined) ? (a.total_balance - start) : null;
+  dp.textContent = dailyPnl === null ? "--" : ((dailyPnl >= 0 ? "+" : "") + fmtMoney(dailyPnl));
+  dp.className = colorCls(dailyPnl);
+
+  // session badge
+  const sb = document.getElementById("session");
+  if (b.session_in) { sb.textContent = "交易时段内"; sb.className = "badge on"; }
+  else { sb.textContent = "时段外(仅监控)"; sb.className = "badge off"; }
+
+  // halt alert
+  const ha = document.getElementById("halted");
+  if (b.halted) { ha.style.display = "block"; ha.textContent = "⚠ 已熔断停止交易：" + (b.halt_reason || ""); }
+  else { ha.style.display = "none"; }
+
+  renderChart(d.equity_history || []);
+  renderPositions(a.positions || []);
+  renderTrades(d.trades || []);
+  renderSys(d);
+
+  const lu = b.last_update ? new Date(b.last_update).toLocaleTimeString("zh-CN") : "--";
+  document.getElementById("refresh").textContent =
+    new Date().toLocaleTimeString("zh-CN") + " · bot " + lu;
+}
+
+function renderChart(hist) {
+  const c = document.getElementById("chart");
+  const ctx = c.getContext("2d");
+  const w = c.width = c.clientWidth * (window.devicePixelRatio || 1);
+  const h = c.height = 120 * (window.devicePixelRatio || 1);
+  ctx.clearRect(0, 0, w, h);
+  if (!hist || hist.length < 2) {
+    ctx.fillStyle = "#8b93a3"; ctx.font = "12px sans-serif";
+    ctx.fillText("数据积累中…", 10, 60);
+    return;
+  }
+  const vals = hist.map(p => p.equity);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const range = (max - min) || 1;
+  const pad = 8;
+  const stepX = (w - pad * 2) / (vals.length - 1);
+  ctx.beginPath();
+  vals.forEach((v, i) => {
+    const x = pad + i * stepX;
+    const y = h - pad - ((v - min) / range) * (h - pad * 2);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = "#4c8dff"; ctx.lineWidth = 2; ctx.stroke();
+  // fill
+  ctx.lineTo(pad + (vals.length - 1) * stepX, h - pad);
+  ctx.lineTo(pad, h - pad); ctx.closePath();
+  ctx.fillStyle = "rgba(76,141,255,.12)"; ctx.fill();
+}
+
+function renderPositions(ps) {
+  const el = document.getElementById("positions");
+  document.getElementById("poscount").textContent = ps.length;
+  if (!ps.length) { el.innerHTML = '<div class="empty">暂无持仓</div>'; return; }
+  el.innerHTML = ps.map(p => {
+    const amt = Number(p.positionAmt || 0);
+    const side = amt > 0 ? "long" : "short";
+    const sideTxt = amt > 0 ? "多" : "空";
+    const up = Number(p.unRealizedProfit || 0);
+    return `<div class="pos">
+      <span class="sym">${p.symbol}</span>
+      <span class="pill ${side}">${sideTxt}</span>
+      <span style="color:var(--muted);font-size:11px">${Math.abs(amt)} 张</span>
+      <div class="meta">
+        <b class="${colorCls(up)}">${up >= 0 ? "+" : ""}${fmt(up, 2)}</b>
+        <span>开仓 ${fmt(p.entryPrice)} → 标记 ${fmt(p.markPrice)}</span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderTrades(ts) {
+  const el = document.getElementById("trades");
+  if (!ts.length) { el.innerHTML = '<div class="empty">暂无成交</div>'; return; }
+  el.innerHTML = [...ts].reverse().map(t => {
+    const cls = colorCls(t.pnl);
+    const sideTxt = t.side === "LONG" ? "多" : "空";
+    return `<div class="trade">
+      <span class="sym" style="font-size:12px">${t.symbol}</span>
+      <span class="pill ${t.side === 'LONG' ? 'long' : 'short'}">${sideTxt}</span>
+      <span style="color:var(--muted);font-size:10px">${t.reason || ""}</span>
+      <span class="pnl ${cls}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl, 2)}</span>
+    </div>`;
+  }).join("");
+}
+
+function renderSys(d) {
+  const b = d.bot || {};
+  const trk = b.tracked_positions || {};
+  const held = Object.keys(trk).length;
+  const symTxt = b.symbols && b.symbols.length > 6
+    ? b.symbols.slice(0, 6).join("、") + " 等" + b.symbols.length + "个"
+    : (b.symbols || []).join("、");
+  const rows = [
+    ["监控币种", symTxt],
+    ["交易时段", b.session_window],
+    ["最大持仓", b.max_open_positions + " 个"],
+    ["已跟踪持仓", held + " 个" + (held ? "：" + Object.entries(trk).map(([s, p]) => s + " " + (p.side === "LONG" ? "多" : "空")).join("、") : "")],
+    ["状态", b.halted ? "已熔断" : (b.session_in ? "运行中" : "仅监控")],
+  ];
+  document.getElementById("sysinfo").innerHTML = rows.map(r =>
+    `<div class="kv"><span class="k">${r[0]}</span><span>${r[1]}</span></div>`).join("");
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
