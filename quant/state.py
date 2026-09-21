@@ -16,6 +16,8 @@ def _default() -> dict:
         "daily_start_equity": 0.0,
         "halted": False,
         "halt_reason": None,
+        "halted_at": None,             # epoch seconds when the breaker tripped
+        "last_wallet": None,           # last observed realized wallet balance (reset detection)
     }
 
 

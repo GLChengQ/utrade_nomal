@@ -137,6 +137,7 @@ class BotConfig:
     max_open_positions: int = 10         # concurrent positions across all symbols (bold)
     max_drawdown_pct: float = 0.15       # halt trading after 15% equity drawdown
     daily_loss_limit_pct: float = 0.03   # halt for the day after 3% daily loss
+    halt_cooldown_hours: float = 8.0     # resume after this many hours (daily-loss halt)
 
     # Execution
     dry_run: bool = False                # True = simulate decisions, no orders
@@ -184,6 +185,7 @@ class BotConfig:
             max_open_positions=_get_int("BOT_MAX_OPEN_POSITIONS", 10),
             max_drawdown_pct=_get_float("BOT_MAX_DRAWDOWN_PCT", 0.15),
             daily_loss_limit_pct=_get_float("BOT_DAILY_LOSS_LIMIT_PCT", 0.03),
+            halt_cooldown_hours=_get_float("BOT_HALT_COOLDOWN_HOURS", 8.0),
             dry_run=_as_bool(os.getenv("BOT_DRY_RUN"), default=False),
             session_enabled=_as_bool(os.getenv("BOT_SESSION_ENABLED"), default=True),
             session_start=_get_str("BOT_SESSION_START", "09:00"),
@@ -195,3 +197,14 @@ class BotConfig:
 # Paths (relative to project root)
 STATE_PATH = BASE_DIR / "state" / "trading_state.json"
 LOG_PATH = BASE_DIR / "logs" / "bot.log"
+
+
+# ----------------------------------------------------------------------
+# MySQL (trade history + reset-event persistence)
+# ----------------------------------------------------------------------
+MYSQL_HOST = os.getenv("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
+MYSQL_USER = os.getenv("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
+MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "binance_bot")
+RESET_DETECT_PCT = float(os.getenv("RESET_DETECT_PCT", "20.0"))  # wallet drop % that flags a reset

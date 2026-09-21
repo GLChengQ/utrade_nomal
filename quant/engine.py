@@ -18,9 +18,11 @@ import random
 import time
 from datetime import datetime, timezone
 
+import config as _cfg
 from binance_futures import BinanceAPIError, BinanceFuturesClient
 from binance_futures.utils import format_step_value
 
+from .db import TradeStore
 from .risk import CircuitBreaker, RiskManager
 from .session import is_in_session
 from .state import StateStore
@@ -52,6 +54,16 @@ class TradingEngine:
         self.state = StateStore(state_path)
         self._cooldown: dict[str, float] = {}  # symbol -> cooldown deadline (epoch seconds)
         self.breaker = CircuitBreaker(cfg.max_drawdown_pct, cfg.daily_loss_limit_pct)
+        # Optional MySQL history store (never let DB issues break trading).
+        try:
+            import config as _config
+            self.store = TradeStore(
+                _config.MYSQL_HOST, _config.MYSQL_PORT, _config.MYSQL_USER,
+                _config.MYSQL_PASSWORD, _config.MYSQL_DATABASE,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("MySQL history store unavailable: %s", exc)
+            self.store = None
         # Persist breaker state across restarts so a crash can't reset limits.
         st = self.state.data
         if st.get("peak_equity"):
@@ -353,10 +365,44 @@ class TradingEngine:
         if pnl is None:
             equity, _ = self._equity()
             pnl = equity - pos.get("entry_equity", equity)
-        trade = {**pos, "closed_at": _now_iso(), "reason": reason, "pnl": round(pnl, 4)}
+        close_type = self._infer_close_type(symbol, pos, reason)
+        trade = {**pos, "closed_at": _now_iso(), "reason": reason, "close_type": close_type, "pnl": round(pnl, 4)}
         self.state.data["trades"].append(trade)
         self.state.save()
-        log.info("TRADE CLOSED %s pnl=%.2f reason=%s", symbol, pnl, reason)
+        if self.store is not None:
+            self.store.record_trade({
+                "symbol": symbol, "side": pos.get("side"), "qty": pos.get("qty"),
+                "units": pos.get("units", 1), "entry": pos.get("entry"),
+                "sl": pos.get("sl"), "tp": pos.get("tp"), "exit": None,
+                "pnl": round(pnl, 4), "reason": reason, "close_type": close_type,
+                "opened_at": pos.get("opened_at"), "closed_at": trade["closed_at"],
+            })
+        log.info("TRADE CLOSED %s pnl=%.2f type=%s reason=%s", symbol, pnl, close_type, reason)
+
+    def _infer_close_type(self, symbol: str, pos: dict, reason: str) -> str:
+        """Infer how a position was closed: 止损 / 止盈 / 主动平仓 / 信号平仓."""
+        if reason not in ("sl/tp", "sl/tp or manual"):
+            return "信号平仓" if reason in ("reverse signal", "exit signal") else reason
+        try:
+            rows = self.client.mark_price(symbol)
+            mark = float(rows[0]["markPrice"]) if isinstance(rows, list) and rows else None
+        except Exception:
+            mark = None
+        if mark is None:
+            return "sl/tp"
+        sl = float(pos.get("sl", 0.0))
+        tp = pos.get("tp")
+        side = pos.get("side")
+        if side == "LONG" and mark <= sl:
+            return "止损"
+        if side == "SHORT" and mark >= sl:
+            return "止损"
+        if tp is not None:
+            if side == "LONG" and mark >= float(tp):
+                return "止盈"
+            if side == "SHORT" and mark <= float(tp):
+                return "止盈"
+        return "主动平仓"
 
     # ------------------------------------------------------------------
     # Main cycle
@@ -366,19 +412,64 @@ class TradingEngine:
         today = datetime.now(timezone.utc).date().isoformat()
         self.state.data["equity_history"].append({"t": _now_iso(), "equity": equity})
 
+        # Reset detection: a sudden large drop in the REALIZED wallet balance
+        # that isn't explained by trading is almost always a testnet reset.
+        if self.store is not None:
+            try:
+                acct = self.client.account()
+                wallet = float(acct.get("totalWalletBalance", 0.0))
+                last_wallet = self.state.data.get("last_wallet")
+                if last_wallet and wallet < last_wallet * (1 - _cfg.RESET_DETECT_PCT / 100.0):
+                    drop_pct = (last_wallet - wallet) / last_wallet * 100.0
+                    self.store.record_reset(
+                        prev_wallet=last_wallet, new_wallet=wallet,
+                        prev_equity=self.state.data.get("peak_equity", last_wallet),
+                        new_equity=equity,
+                        note=f"wallet dropped {drop_pct:.1f}% (likely testnet account reset)",
+                    )
+                    log.warning("ACCOUNT RESET DETECTED: wallet %.2f -> %.2f (%.1f%%)",
+                                last_wallet, wallet, drop_pct)
+                self.state.data["last_wallet"] = wallet
+            except Exception as exc:  # noqa: BLE001
+                log.debug("reset detection skipped: %s", exc)
+
         halt_reason = self.breaker.check(equity, today)
         self.state.data["peak_equity"] = self.breaker.peak_equity
         self.state.data["daily_date"] = self.breaker.daily_date
         self.state.data["daily_start_equity"] = self.breaker.daily_start_equity
+
+        was_halted = bool(self.state.data.get("halted"))
+        prev_reason = str(self.state.data.get("halt_reason", ""))
+        is_daily = not prev_reason.startswith("max drawdown")
+
+        # Auto-clear daily-loss halts: cooldown elapsed, or condition recovered.
+        # (max-drawdown halts stay until manually reset.)
+        if was_halted and is_daily:
+            tripped_at = self.state.data.get("halted_at") or time.time()
+            cooldown_elapsed = (time.time() - tripped_at) >= self.cfg.halt_cooldown_hours * 3600
+            condition_cleared = halt_reason is None
+            if cooldown_elapsed or condition_cleared:
+                self.state.data["halted"] = False
+                self.state.data["halt_reason"] = None
+                self.state.data["halted_at"] = None
+                if cooldown_elapsed:
+                    # Re-baseline the daily reference so the new session starts fresh.
+                    self.breaker.daily_date = None
+                    self.breaker.daily_start_equity = None
+                    self.state.data["daily_date"] = None
+                    self.state.data["daily_start_equity"] = None
+                    halt_reason = None  # ignore the stale breach after re-baseline
+                    log.info("circuit breaker cooldown (%.1fh) elapsed — resuming", self.cfg.halt_cooldown_hours)
+                else:
+                    log.info("circuit breaker cleared — resuming trading")
+                was_halted = False
+
         if halt_reason:
+            if not was_halted:
+                self.state.data["halted_at"] = time.time()
+                log.error("CIRCUIT BREAKER TRIPPED: %s", halt_reason)
             self.state.data["halted"] = True
             self.state.data["halt_reason"] = halt_reason
-            log.error("CIRCUIT BREAKER TRIPPED: %s", halt_reason)
-        elif self.state.data.get("halted") and not str(self.state.data.get("halt_reason", "")).startswith("max drawdown"):
-            # A daily-loss halt auto-clears once the condition no longer holds.
-            self.state.data["halted"] = False
-            self.state.data["halt_reason"] = None
-            log.info("circuit breaker cleared — resuming trading")
 
         halted = bool(self.state.data.get("halted"))
         in_sess = self._in_session()

@@ -102,6 +102,16 @@
     <div id="trades"><div class="empty">暂无成交</div></div>
   </div>
 
+  <details class="card">
+    <summary class="label" style="cursor:pointer">历史成交 (MySQL) · <span id="histcount">0</span> 笔 · 点击展开</summary>
+    <div id="history" style="margin-top:8px"><div class="empty">加载中…</div></div>
+  </details>
+
+  <div class="card" id="resetsCard" style="display:none">
+    <div class="label">⚠ 账户重置记录</div>
+    <div id="resets"></div>
+  </div>
+
   <div class="card">
     <div class="label">系统状态</div>
     <div id="sysinfo"><div class="empty">--</div></div>
@@ -180,19 +190,36 @@ function renderChart(hist) {
   const vals = hist.map(p => p.equity);
   const min = Math.min(...vals), max = Math.max(...vals);
   const range = (max - min) || 1;
-  const pad = 8;
-  const stepX = (w - pad * 2) / (vals.length - 1);
+  const padL = 34, padR = 8, padT = 8, padB = 16;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+  const stepX = plotW / (vals.length - 1);
+  // Y axis labels (min/mid/max) and gridlines
+  ctx.font = `${10 * (window.devicePixelRatio || 1)}px sans-serif`;
+  ctx.fillStyle = "#8b93a3";
+  ctx.strokeStyle = "#262d3a"; ctx.lineWidth = 1;
+  [0, 0.5, 1].forEach(f => {
+    const y = padT + plotH * (1 - f);
+    const val = min + range * f;
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+    ctx.fillText(val.toFixed(0), 2, y + 3);
+  });
+  // line
   ctx.beginPath();
   vals.forEach((v, i) => {
-    const x = pad + i * stepX;
-    const y = h - pad - ((v - min) / range) * (h - pad * 2);
+    const x = padL + i * stepX;
+    const y = padT + plotH * (1 - (v - min) / range);
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   });
   ctx.strokeStyle = "#4c8dff"; ctx.lineWidth = 2; ctx.stroke();
-  // fill
-  ctx.lineTo(pad + (vals.length - 1) * stepX, h - pad);
-  ctx.lineTo(pad, h - pad); ctx.closePath();
+  ctx.lineTo(padL + (vals.length - 1) * stepX, padT + plotH);
+  ctx.lineTo(padL, padT + plotH); ctx.closePath();
   ctx.fillStyle = "rgba(76,141,255,.12)"; ctx.fill();
+  // X axis labels (first / last time)
+  const t0 = hist[0].t ? hist[0].t.slice(11, 16) : "";
+  const t1 = hist[hist.length - 1].t ? hist[hist.length - 1].t.slice(11, 16) : "";
+  ctx.fillStyle = "#8b93a3";
+  ctx.fillText(t0, padL, h - 2);
+  ctx.fillText(t1, w - padR - 30, h - 2);
 }
 
 function renderPositions(ps) {
@@ -222,10 +249,11 @@ function renderTrades(ts) {
   el.innerHTML = [...ts].reverse().map(t => {
     const cls = colorCls(t.pnl);
     const sideTxt = t.side === "LONG" ? "多" : "空";
+    const ct = t.close_type || t.reason || "";
     return `<div class="trade">
       <span class="sym" style="font-size:12px">${t.symbol}</span>
       <span class="pill ${t.side === 'LONG' ? 'long' : 'short'}">${sideTxt}</span>
-      <span style="color:var(--muted);font-size:10px">${t.reason || ""}</span>
+      <span class="pill" style="background:#2a3140;color:#cbd2de;font-size:10px">${ct}</span>
       <span class="pnl ${cls}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl, 2)}</span>
     </div>`;
   }).join("");
@@ -249,8 +277,54 @@ function renderSys(d) {
     `<div class="kv"><span class="k">${r[0]}</span><span>${r[1]}</span></div>`).join("");
 }
 
+async function refreshHistory() {
+  try {
+    const r = await fetch("/api/history", { cache: "no-store" });
+    const d = await r.json();
+    renderHistory(d.trades || []);
+    renderResets(d.resets || []);
+  } catch (e) { /* ignore */ }
+}
+
+function renderHistory(ts) {
+  const el = document.getElementById("history");
+  document.getElementById("histcount").textContent = ts.length;
+  if (!ts.length) { el.innerHTML = '<div class="empty">暂无历史记录</div>'; return; }
+  el.innerHTML = ts.slice(0, 50).map(t => {
+    const cls = colorCls(t.pnl);
+    const sideTxt = t.side === "LONG" ? "多" : "空";
+    const ct = t.close_type || t.reason || "";
+    return `<div class="trade" style="flex-wrap:wrap">
+      <div style="display:flex;width:100%;align-items:center">
+        <span class="sym" style="font-size:12px">${t.symbol}</span>
+        <span class="pill ${t.side === 'LONG' ? 'long' : 'short'}">${sideTxt}</span>
+        <span style="color:var(--muted);font-size:10px;margin-left:4px">${t.closed_at ? t.closed_at.slice(5,16) : ""}</span>
+        <span class="pill" style="margin-left:auto;background:#2a3140;color:#cbd2de">${ct}</span>
+        <span class="pnl ${cls}">${t.pnl >= 0 ? "+" : ""}${fmt(t.pnl, 2)}</span>
+      </div>
+      <div style="font-size:10px;color:var(--muted);margin-top:2px">
+        开仓 ${fmt(t.entry, 6)} · 止损 ${fmt(t.stop_loss, 6)} · 止盈 ${t.take_profit ? fmt(t.take_profit, 6) : "无"}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+function renderResets(rs) {
+  const card = document.getElementById("resetsCard");
+  const el = document.getElementById("resets");
+  if (!rs || !rs.length) { card.style.display = "none"; return; }
+  card.style.display = "block";
+  el.innerHTML = rs.map(r => `<div class="kv">
+    <span class="k">${r.detected_at || ""}</span>
+    <span class="down">钱包 ${fmt(r.prev_wallet,2)} → ${fmt(r.new_wallet,2)}</span>
+  </div>
+  <div class="empty">${r.note || ""}</div>`).join("");
+}
+
 refresh();
+refreshHistory();
 setInterval(refresh, 15000);
+setInterval(refreshHistory, 30000);
 </script>
 </body>
 </html>

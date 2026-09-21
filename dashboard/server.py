@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import config
 from binance_futures import BinanceFuturesClient
+from quant.db import TradeStore
 from quant.session import is_in_session
 
 HERE = Path(__file__).resolve().parent
@@ -32,8 +33,30 @@ PORT = int(os.getenv("DASH_PORT", "8080"))
 CACHE_TTL = 10.0  # seconds to cache the live account snapshot
 
 _client = None
+_store = None
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
+
+
+def get_store() -> TradeStore:
+    global _store
+    if _store is None:
+        _store = TradeStore(
+            config.MYSQL_HOST, config.MYSQL_PORT, config.MYSQL_USER,
+            config.MYSQL_PASSWORD, config.MYSQL_DATABASE,
+        )
+    return _store
+
+
+def history(limit: int = 200) -> dict:
+    try:
+        store = get_store()
+        return {
+            "trades": store.fetch_trades(limit),
+            "resets": store.fetch_resets(50),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"trades": [], "resets": [], "error": str(exc)}
 
 
 def get_client() -> BinanceFuturesClient:
@@ -108,7 +131,7 @@ def summary() -> dict:
             "tracked_positions": st.get("positions", {}),
             "last_update": last_update,
         },
-        "equity_history": equity_hist[-500:],
+        "equity_history": equity_hist[-2000:],
         "trades": st.get("trades", [])[-50:],
         "daily": {
             "date": st.get("daily_date"),
@@ -131,6 +154,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/api/summary"):
             try:
                 self._send(200, json.dumps(summary(), ensure_ascii=False), "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
+        elif self.path.startswith("/api/history"):
+            try:
+                self._send(200, json.dumps(history(), ensure_ascii=False), "application/json; charset=utf-8")
             except Exception as exc:  # noqa: BLE001
                 self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
         elif self.path in ("/", "/index.html"):
