@@ -128,11 +128,12 @@ class TurtleStrategy:
         return Signal("FLAT", "no breakout", a)
 
     def levels(self, entry: float, atr_value: float, side: str) -> tuple[float, float | None]:
-        """Stop at 2*ATR; take-profit at risk_reward * stop distance."""
+        """Stop at 2*ATR; no fixed take-profit — profits are locked in by the
+        trailing stop (peak - 2*ATR) instead of a fixed target."""
         distance = atr_value * self.stop_atr_mult
         if side == "LONG":
-            return entry - distance, entry + distance * self.risk_reward
-        return entry + distance, entry - distance * self.risk_reward
+            return entry - distance, None
+        return entry + distance, None
 
 
 @dataclass
@@ -221,7 +222,8 @@ class VGASStrategy:
         return Signal("FLAT", "no breakout", a)
 
     def levels(self, entry: float, atr_value: float, side: str) -> tuple[float, float | None]:
+        """Stop at 2*ATR; no fixed take-profit (trailing stop handles profit)."""
         distance = atr_value * self.stop_atr_mult
         if side == "LONG":
-            return entry - distance, entry + distance * self.risk_reward
-        return entry + distance, entry - distance * self.risk_reward
+            return entry - distance, None
+        return entry + distance, None

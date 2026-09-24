@@ -24,7 +24,7 @@ from binance_futures.utils import format_step_value
 
 from .db import TradeStore
 from .risk import CircuitBreaker, RiskManager
-from .session import is_in_session
+from .session import is_in_session, trading_day_key
 from .state import StateStore
 from .strategy import EMACrossoverStrategy, Signal
 
@@ -240,6 +240,13 @@ class TradingEngine:
     def _add_unit(self, symbol: str, pos_state: dict, price: float, atr_value: float) -> None:
         side = pos_state["side"]
         sl, _tp = self.strategy.levels(price, atr_value, side)
+        # Never move the stop AGAINST the position: keep the higher of the new
+        # add-level stop and the existing (possibly trailing) stop.
+        cur_sl = float(pos_state.get("sl", sl))
+        if side == "LONG":
+            sl = max(sl, cur_sl)
+        else:
+            sl = min(sl, cur_sl)
         filters = self.client.symbol_filters(symbol)
         equity, available = self._equity()
         qty = self.risk.position_size(equity, price, sl, filters.step_size, filters.min_qty)
@@ -316,8 +323,7 @@ class TradingEngine:
         if self.dry_run:
             log.info("[DRY-RUN] would CLOSE %s (%s)", symbol, reason)
             return
-        close_side = "SELL" if side == "LONG" else "BUY"
-        self.client.place_order(symbol, close_side, "MARKET", closePosition="true")
+        self.client.close_position_market(symbol)
         self._wait_flat(symbol)
         self._record_close(symbol, reason)
 
@@ -325,6 +331,7 @@ class TradingEngine:
     # State recording
     # ------------------------------------------------------------------
     def _record_open(self, symbol, side, qty, entry, sl, tp, equity) -> None:
+        qty_f = float(qty)
         self.state.data["positions"][symbol] = {
             "symbol": symbol,
             "side": side,
@@ -338,6 +345,8 @@ class TradingEngine:
             "opened_at": _now_iso(),
             "opened_at_ms": int(time.time() * 1000),
             "entry_equity": equity,
+            "total_notional": qty_f * entry,
+            "units_detail": [{"entry": entry, "qty": qty_f, "at": _now_iso()}],
         }
         self.state.save()
 
@@ -346,6 +355,9 @@ class TradingEngine:
         pos_state["last_add_price"] = price
         pos_state["entry"] = price
         pos_state["sl"] = sl
+        qty_f = float(pos_state.get("qty", 0))
+        pos_state["total_notional"] = float(pos_state.get("total_notional", 0)) + qty_f * price
+        pos_state.setdefault("units_detail", []).append({"entry": price, "qty": qty_f, "at": _now_iso()})
         self.state.save()
 
     def _realized_pnl_since(self, symbol: str, start_ms: int) -> float | None:
@@ -370,11 +382,16 @@ class TradingEngine:
         self.state.data["trades"].append(trade)
         self.state.save()
         if self.store is not None:
+            import json as _json
+            notional = float(pos.get("total_notional", float(pos.get("qty", 0)) * float(pos.get("entry", 0))))
+            margin = notional / self.cfg.max_leverage
             self.store.record_trade({
                 "symbol": symbol, "side": pos.get("side"), "qty": pos.get("qty"),
                 "units": pos.get("units", 1), "entry": pos.get("entry"),
                 "sl": pos.get("sl"), "tp": pos.get("tp"), "exit": None,
                 "pnl": round(pnl, 4), "reason": reason, "close_type": close_type,
+                "margin": round(margin, 4),
+                "units_detail": _json.dumps(pos.get("units_detail", []), ensure_ascii=False),
                 "opened_at": pos.get("opened_at"), "closed_at": trade["closed_at"],
             })
         log.info("TRADE CLOSED %s pnl=%.2f type=%s reason=%s", symbol, pnl, close_type, reason)
@@ -407,10 +424,49 @@ class TradingEngine:
     # ------------------------------------------------------------------
     # Main cycle
     # ------------------------------------------------------------------
+    def _check_resume_request(self, equity: float) -> None:
+        """Clear the halt (and re-baseline the drawdown peak) if the dashboard
+        wrote a resume.flag file. Manual resume = user acknowledges the drawdown
+        and wants a fresh baseline."""
+        flag = self.state.path.parent / "resume.flag"
+        if not flag.exists():
+            return
+        try:
+            flag.unlink()
+        except Exception:
+            pass
+        if not self.state.data.get("halted"):
+            return
+        self.state.data["halted"] = False
+        self.state.data["halt_reason"] = None
+        self.state.data["halted_at"] = None
+        # Re-baseline BOTH the daily loss and the drawdown peak so the breaker
+        # does not re-trip immediately on the next cycle.
+        self.breaker.daily_date = None
+        self.breaker.daily_start_equity = None
+        self.breaker.peak_equity = equity
+        self.state.data["daily_date"] = None
+        self.state.data["daily_start_equity"] = None
+        self.state.data["peak_equity"] = equity
+        self.state.save()
+        if self.store is not None:
+            self.store.record_circuit_event("manual_resume", "manual resume via dashboard", equity)
+        log.info("manual resume: circuit breaker cleared via dashboard (peak re-based to %.2f)", equity)
+
     def run_cycle(self) -> None:
         equity, _ = self._equity()
-        today = datetime.now(timezone.utc).date().isoformat()
+        self._check_resume_request(equity)
+
+        today = trading_day_key()
         self.state.data["equity_history"].append({"t": _now_iso(), "equity": equity})
+        if self.store is not None:
+            self.store.record_equity(equity)
+
+        # True day-open equity (9:00 Beijing): set once per trading day, never
+        # touched by the circuit breaker.
+        if self.state.data.get("day_open_date") != today:
+            self.state.data["day_open_date"] = today
+            self.state.data["day_open_equity"] = equity
 
         # Reset detection: a sudden large drop in the REALIZED wallet balance
         # that isn't explained by trading is almost always a testnet reset.
@@ -436,6 +492,14 @@ class TradingEngine:
         halt_reason = self.breaker.check(equity, today)
         self.state.data["peak_equity"] = self.breaker.peak_equity
         self.state.data["daily_date"] = self.breaker.daily_date
+        # Circuit breaker can be disabled via a toggle (test environment default: OFF).
+        self.breaker_enabled = (self.state.path.parent / "breaker_on.flag").exists()
+        if not self.breaker_enabled:
+            halt_reason = None
+            if self.state.data.get("halted"):
+                self.state.data["halted"] = False
+                self.state.data["halt_reason"] = None
+                self.state.data["halted_at"] = None
         self.state.data["daily_start_equity"] = self.breaker.daily_start_equity
 
         was_halted = bool(self.state.data.get("halted"))
@@ -460,14 +524,20 @@ class TradingEngine:
                     self.state.data["daily_start_equity"] = None
                     halt_reason = None  # ignore the stale breach after re-baseline
                     log.info("circuit breaker cooldown (%.1fh) elapsed — resuming", self.cfg.halt_cooldown_hours)
+                    if self.store is not None:
+                        self.store.record_circuit_event("clear", "cooldown elapsed", equity)
                 else:
                     log.info("circuit breaker cleared — resuming trading")
+                    if self.store is not None:
+                        self.store.record_circuit_event("clear", "condition recovered", equity)
                 was_halted = False
 
         if halt_reason:
             if not was_halted:
                 self.state.data["halted_at"] = time.time()
                 log.error("CIRCUIT BREAKER TRIPPED: %s", halt_reason)
+                if self.store is not None:
+                    self.store.record_circuit_event("trip", halt_reason, equity)
             self.state.data["halted"] = True
             self.state.data["halt_reason"] = halt_reason
 

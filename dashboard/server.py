@@ -54,9 +54,66 @@ def history(limit: int = 200) -> dict:
         return {
             "trades": store.fetch_trades(limit),
             "resets": store.fetch_resets(50),
+            "circuit_logs": store.fetch_circuit_logs(100),
+            "net_equity": store.fetch_net_equity(2000),
         }
     except Exception as exc:  # noqa: BLE001
-        return {"trades": [], "resets": [], "error": str(exc)}
+        return {"trades": [], "resets": [], "circuit_logs": [], "net_equity": [], "error": str(exc)}
+
+
+def calendar_data(year: int, month: int) -> dict:
+    try:
+        store = get_store()
+        return {"days": store.fetch_daily_summary(year, month)}
+    except Exception as exc:  # noqa: BLE001
+        return {"days": [], "error": str(exc)}
+
+
+def curves_data(days: int) -> dict:
+    try:
+        store = get_store()
+        return {
+            "equity_history": store.fetch_equity_history(days),
+            "net_equity": store.fetch_net_equity(2000),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"equity_history": [], "net_equity": [], "error": str(exc)}
+
+
+def request_resume() -> dict:
+    """Write a resume flag for the bot to pick up on its next cycle."""
+    flag = config.STATE_PATH.parent / "resume.flag"
+    flag.write_text("manual resume", encoding="utf-8")
+    return {"ok": True, "msg": "resume request written; bot will resume on next cycle"}
+
+
+def breaker_flag() -> bool:
+    return (config.STATE_PATH.parent / "breaker_on.flag").exists()
+
+
+def toggle_breaker() -> dict:
+    flag = config.STATE_PATH.parent / "breaker_on.flag"
+    if flag.exists():
+        flag.unlink()
+        return {"ok": True, "breaker_enabled": False, "msg": "熔断已关闭"}
+    flag.write_text("on", encoding="utf-8")
+    return {"ok": True, "breaker_enabled": True, "msg": "熔断已开启"}
+
+
+def close_position(symbol: str) -> dict:
+    """Manually close a position with a market order (user-driven take-profit)."""
+    try:
+        c = get_client()
+        r = c.close_position_market(symbol)
+        if r is None:
+            return {"ok": False, "msg": f"{symbol} 无持仓"}
+        try:
+            c.cancel_all_algo_orders(symbol)  # clear stale SL/TP protective orders
+        except Exception:
+            pass
+        return {"ok": True, "msg": f"{symbol} 已发送平仓单"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "msg": str(exc)}
 
 
 def get_client() -> BinanceFuturesClient:
@@ -128,14 +185,17 @@ def summary() -> dict:
             "max_open_positions": cfg.max_open_positions,
             "halted": st.get("halted", False),
             "halt_reason": st.get("halt_reason"),
+            "halted_at": st.get("halted_at"),
+            "halt_cooldown_hours": cfg.halt_cooldown_hours,
+            "breaker_enabled": breaker_flag(),
             "tracked_positions": st.get("positions", {}),
             "last_update": last_update,
         },
         "equity_history": equity_hist[-2000:],
         "trades": st.get("trades", [])[-50:],
         "daily": {
-            "date": st.get("daily_date"),
-            "start_equity": st.get("daily_start_equity"),
+            "date": st.get("day_open_date"),
+            "start_equity": st.get("day_open_equity"),
         },
     }
 
@@ -161,9 +221,48 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(history(), ensure_ascii=False), "application/json; charset=utf-8")
             except Exception as exc:  # noqa: BLE001
                 self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
+        elif self.path.startswith("/api/calendar"):
+            try:
+                q = self.path.split("?", 1)
+                params = dict(p.split("=") for p in q[1].split("&") if "=" in p) if len(q) > 1 else {}
+                year = int(params.get("year", datetime.now().year))
+                month = int(params.get("month", datetime.now().month))
+                self._send(200, json.dumps(calendar_data(year, month), ensure_ascii=False), "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
+        elif self.path.startswith("/api/curves"):
+            try:
+                q = self.path.split("?", 1)
+                params = dict(p.split("=") for p in q[1].split("&") if "=" in p) if len(q) > 1 else {}
+                days = int(params.get("days", 7))
+                self._send(200, json.dumps(curves_data(days), ensure_ascii=False), "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
         elif self.path in ("/", "/index.html"):
             html = (HERE / "index.html").read_text(encoding="utf-8")
             self._send(200, html, "text/html; charset=utf-8")
+        else:
+            self._send(404, "not found", "text/plain; charset=utf-8")
+
+    def do_POST(self) -> None:
+        if self.path.startswith("/api/resume"):
+            try:
+                self._send(200, json.dumps(request_resume(), ensure_ascii=False), "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
+        elif self.path.startswith("/api/close"):
+            try:
+                q = self.path.split("?", 1)
+                params = dict(p.split("=") for p in q[1].split("&") if "=" in p) if len(q) > 1 else {}
+                symbol = params.get("symbol", "")
+                self._send(200, json.dumps(close_position(symbol), ensure_ascii=False), "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
+        elif self.path.startswith("/api/toggle_breaker"):
+            try:
+                self._send(200, json.dumps(toggle_breaker(), ensure_ascii=False), "application/json; charset=utf-8")
+            except Exception as exc:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(exc)}), "application/json; charset=utf-8")
         else:
             self._send(404, "not found", "text/plain; charset=utf-8")
 

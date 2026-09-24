@@ -211,6 +211,23 @@ class BinanceFuturesClient:
         params.update(kwargs)
         return self._request("POST", "/fapi/v1/order", params, signed=True)
 
+    def close_position_market(self, symbol: str) -> dict | None:
+        """Close an existing position at market price via a reduceOnly order.
+
+        Binance rejects closePosition=true with MARKET (error -4136), so we use
+        reduceOnly=true with the full position quantity instead — the same way
+        the exchange's own "market close" button works.
+        """
+        rows = self.position_risk(symbol)
+        if not rows:
+            return None
+        amt = float(rows[0].get("positionAmt", 0.0))
+        if amt == 0:
+            return None
+        side = "SELL" if amt > 0 else "BUY"
+        qty = abs(amt)
+        return self.place_order(symbol, side, "MARKET", quantity=str(qty), reduceOnly="true")
+
     def batch_orders(self, orders: list[dict]) -> list:
         """Place multiple orders in one request. Each dict is a full order payload."""
         return self._request("POST", "/fapi/v1/batchOrders", {"batchOrders": self._to_json(orders)}, signed=True)

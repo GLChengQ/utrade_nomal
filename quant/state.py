@@ -13,7 +13,9 @@ def _default() -> dict:
         "equity_history": [],         # [{t, equity}] trimmed to last N entries
         "peak_equity": 0.0,
         "daily_date": None,
-        "daily_start_equity": 0.0,
+        "daily_start_equity": 0.0,     # breaker baseline (may re-baseline after a halt)
+        "day_open_date": None,         # true trading day key (9:00 Beijing)
+        "day_open_equity": 0.0,        # TRUE equity at 9:00 (display only, never reset by breaker)
         "halted": False,
         "halt_reason": None,
         "halted_at": None,             # epoch seconds when the breaker tripped

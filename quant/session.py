@@ -37,3 +37,13 @@ def is_in_session(
 
 def session_label(start: str, end: str, utc_offset_hours: int) -> str:
     return f"{start} ~ {end} (UTC+{utc_offset_hours})"
+
+
+def trading_day_key(now: datetime | None = None, day_start: str = "09:00") -> str:
+    """Return the 'trading day' key: the Beijing date, but a day starts at
+    `day_start` (09:00) rather than midnight. Used for daily PnL boundaries."""
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(timezone(timedelta(hours=8)))
+    if local.hour < parse_hhmm(day_start) // 60:
+        local = local - timedelta(days=1)
+    return local.date().isoformat()
